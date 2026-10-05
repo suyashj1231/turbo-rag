@@ -1,28 +1,30 @@
 # turbo-rag
 
-A RAG system built from scratch (no LangChain or LlamaIndex) over the
-[Kaggle 7k Books](https://www.kaggle.com/datasets/dylanjcastillo/7k-books-with-metadata) dataset:
+turbo-rag answers questions about books. It runs over the [Kaggle 7k Books](https://www.kaggle.com/datasets/dylanjcastillo/7k-books-with-metadata) dataset and is written from scratch, without LangChain or LlamaIndex.
 
-- **Hybrid retrieval**: BM25 written from scratch plus dense vectors (MiniLM), fused with Reciprocal Rank Fusion
-- **Cross-encoder reranking**: Cohere Rerank, or a local ms-marco cross-encoder when no key is set
-- **Citation-enforced answers**: numbered sources, a citation validator, one repair retry, then it fails closed to "I don't know"
-- **Multi-turn chat**: questions rewritten with conversation history, sessions persisted in SQLite (same key design as DynamoDB)
-- **HTTP API**: FastAPI (stands in for API Gateway + Lambda)
-- **CI-gated evaluation**: a retrieval-metrics gate plus a Ragas gate (faithfulness, answer relevancy, context precision)
+You can ask it something vague, like "that sci-fi book where a modern town gets sent back to the 1600s", and it finds the book, answers, and cites the descriptions it used. If it can't back an answer with a citation, it says it doesn't know.
 
-Next on the roadmap: a from-scratch **TurboQuant** quantized index (see [PLAN.md](PLAN.md)).
-Interview study guide: [docs/INTERVIEW.md](docs/INTERVIEW.md).
+What's in it:
+
+- Hybrid retrieval. A hand-written BM25 index and dense MiniLM vectors, merged with Reciprocal Rank Fusion.
+- Reranking with Cohere Rerank, or a local ms-marco cross-encoder if you don't set a Cohere key.
+- Answers with numbered citations. A validator checks every sentence, the model gets one retry to fix missing citations, and after that the answer is replaced with "I don't know".
+- Multi-turn chat. Follow-up questions are rewritten using the conversation history, and sessions are stored in SQLite with the same key layout you'd use in DynamoDB.
+- A FastAPI server, standing in for API Gateway plus Lambda.
+- Evaluation that runs in CI: a retrieval-metrics gate, then a Ragas gate for faithfulness, answer relevancy and context precision.
+
+The next planned piece is a quantized index built from scratch with TurboQuant (see [PLAN.md](PLAN.md)). There's also an interview study guide in [docs/INTERVIEW.md](docs/INTERVIEW.md).
 
 ## Setup
 
 ```bash
-uv sync                    # Python deps (dev + eval groups included)
-cp .env.example .env       # GEMINI_API_KEY (required), COHERE_API_KEY (optional)
+uv sync                    # Python deps, including the dev and eval groups
+cp .env.example .env       # GEMINI_API_KEY is required, COHERE_API_KEY is optional
 
 mkdir -p data/raw && curl -sL -o /tmp/books.zip \
   https://www.kaggle.com/api/v1/datasets/download/dylanjcastillo/7k-books-with-metadata \
   && unzip -o /tmp/books.zip -d data/raw
-uv run rag ingest          # 6,810 books -> 8,047 chunks -> embeddings (~1 min on a laptop)
+uv run rag ingest          # 6,810 books -> 8,047 chunks -> embeddings, about a minute on a laptop
 ```
 
 ## Usage
@@ -32,19 +34,28 @@ uv run rag ask "that sci-fi book where a modern town gets sent back to the 1600s
 uv run rag ask "books by Marilynne Robinson" --mode bm25   # dense | bm25 | hybrid | hybrid_rerank
 uv run rag chat                                            # multi-turn REPL
 uv run rag serve                                           # API on :8000
+```
 
+Talking to the API:
+
+```bash
 curl -X POST localhost:8000/chat -H 'content-type: application/json' \
      -d '{"message": "a funny novel about a simple soldier in WW1"}'
 # -> {session_id, answer, citations, sources, standalone_query, grounded, refused}
+
 curl -X POST localhost:8000/chat -H 'content-type: application/json' \
      -d '{"session_id": "<id>", "message": "which American novel did it inspire?"}'
+```
 
-uv run pytest                          # 44 unit tests, no keys needed
-uv run rag validate-golden             # check golden labels against the corpus
-uv run rag eval --no-llm               # retrieval ablation on the golden set (free, deterministic)
-uv run rag eval                        # + multi-turn, LLM-as-judge grading, refusal check
-uv run rag eval --set dev              # same, on the dev set you iterate on
-uv run rag ragas --gate                # Ragas metrics on golden, exit 1 below thresholds
+Tests and evaluation:
+
+```bash
+uv run pytest                          # 44 unit tests, no API keys needed
+uv run rag validate-golden             # check the golden labels against the corpus
+uv run rag eval --no-llm               # retrieval comparison on the golden set (free and deterministic)
+uv run rag eval                        # adds multi-turn, LLM-as-judge grading and the refusal check
+uv run rag eval --set dev              # the same, on the dev set
+uv run rag ragas --gate                # Ragas metrics on golden, exits 1 if below thresholds
 ```
 
 ## Architecture
@@ -68,61 +79,68 @@ CI        pytest ─► retrieval gate (hit/MRR/recall vs thresholds.json) ─�
 
 ## Eval sets
 
-| set | file | size | how it's made | used for |
+There are two question sets, and they have different jobs.
+
+| set | file | size | how it was made | used for |
 |---|---|---|---|---|
-| **golden** | `data/eval/golden.jsonl` | 35 | hand-written, checked against the corpus, frozen | reported numbers + CI gate |
-| dev | `data/eval/dev.jsonl` | 55 | 40 LLM-generated + 15 hand-written | iterating and tuning |
+| golden | `data/eval/golden.jsonl` | 58 | written by hand, checked against the corpus, then frozen | reported numbers and the CI gate |
+| dev | `data/eval/dev.jsonl` | 55 | 40 generated by an LLM, 15 written by hand | day-to-day tuning |
 
-Golden labels name **books (every edition) plus an evidence quote**, not chunk
-ids, so they still hold if chunking changes. `rag validate-golden` checks every
-label: the doc exists, the evidence appears in it, no unlabeled editions, no
-overlap with the dev set. Categories: vague, lookup, metadata, author_list,
-multi_book, multi_turn, unanswerable (including near-misses: real books that
-aren't in the corpus).
+Golden labels point at books (every edition of them) plus a quote from the description as evidence. They don't point at chunk ids, so changing the chunker doesn't break them. `rag validate-golden` checks that each labeled book exists, that the evidence quote really appears in it, that no edition was left unlabeled, and that no question also appears in the dev set.
 
-## Results: golden set (k=5, local cross-encoder reranker)
+The 58 golden questions break down like this: 8 vague, 7 lookup, 6 metadata, 5 stats, 5 author_list, 5 multi_book, 5 filter, 5 typo, 5 multi_turn, and 7 unanswerable. Some of the unanswerable ones are near misses: real books that just aren't in this dataset.
 
-24 single-turn answerable items (the 4 multi-turn items need the LLM, and the 7 unanswerable items are scored by refusal):
+## Results on the golden set
 
-| mode            | hit@5 | recall@5 | MRR   | vague MRR | multi_book recall | p50 latency |
-|-----------------|------:|---------:|------:|----------:|------------------:|------------:|
-| dense           | 0.958 | 0.805 | 0.821 | 0.650 | 0.533 | 17 ms |
-| bm25            | 0.917 | 0.761 | 0.819 | 0.667 | 0.467 | 0.4 ms |
-| hybrid (RRF)    | 0.917 | 0.822 | 0.833 | 0.562 | **0.700** | 7 ms |
-| hybrid + rerank | **1.000** | **0.912** | **0.958** | **0.938** | 0.533 | 123 ms |
+These are the 46 single-turn questions that have an answer, at k=5 with the local cross-encoder. The 5 multi-turn questions need the LLM to rewrite the query, and the 7 unanswerable ones are scored on whether the system refuses, so neither group is in this table.
 
-Multi-turn (hybrid + rerank): follow-ups retrieved with the raw message hit
-2/4; with LLM query condensation, 4/4.
+| mode            | hit@5 | recall@5 | MRR   | p50 latency |
+|-----------------|------:|---------:|------:|------------:|
+| dense           | 0.891 | 0.736    | 0.763 | 12 ms       |
+| bm25            | 0.891 | 0.771    | 0.793 | 0.4 ms      |
+| hybrid (RRF)    | 0.935 | 0.831    | 0.809 | 15 ms       |
+| hybrid + rerank | 0.978 | 0.892    | 0.877 | ~130 ms     |
 
-Small-n caveat: one question is about 4% of the "all" row. Treat differences
-under about 0.05 as noise.
+Reranking makes the biggest difference on vague questions (MRR goes from 0.588 with plain hybrid to 0.938) and on filter questions like "a fantasy novel from after 2000" (0.400 to 0.717). Typo questions are still the weak spot: MRR 0.550 even with reranking.
 
-## Results: dev set (55 questions)
+The latency numbers come from a laptop. On a CI runner the reranker takes closer to a second per query.
+
+With this few questions, one question moves a category's score by 0.1 to 0.2, and the overall row by about 0.02. I wouldn't read much into a difference smaller than about 0.05.
+
+Multi-turn questions show why query rewriting is there. When follow-ups like "who wrote it?" go to retrieval as typed, they mostly miss (MRR near 0). After the LLM rewrites them with the conversation history, they hit.
+
+## Results on the dev set
 
 | mode            | hit@5 | recall@5 | MRR   | p50 latency |
 |-----------------|------:|---------:|------:|------------:|
 | dense           | 0.855 | 0.768    | 0.779 | 14 ms       |
 | bm25            | 0.945 | 0.820    | 0.918 | 0.5 ms      |
 | hybrid (RRF)    | 0.945 | 0.864    | 0.885 | 9 ms        |
-| hybrid + rerank | **0.982** | **0.885** | **0.964** | 145 ms |
+| hybrid + rerank | 0.982 | 0.885    | 0.964 | 145 ms      |
 
-On the 15 hand-written **vague** questions ("a sci-fi book where a mining town
-gets thrown back in time"), the hardest split:
+BM25 looks very strong here because most dev questions were written by an LLM that copied rare names straight out of the descriptions. The 15 hand-written vague questions ("a sci-fi book where a mining town gets thrown back in time") give a fairer picture:
 
 | mode            | hit@5 | MRR   |
 |-----------------|------:|------:|
 | dense           | 0.667 | 0.469 |
 | bm25            | 0.800 | 0.700 |
 | hybrid          | 0.800 | 0.647 |
-| hybrid + rerank | **0.933** | **0.867** |
+| hybrid + rerank | 0.933 | 0.867 |
 
-Ragas smoke test (2 questions; full run pending API quota): faithfulness 1.00,
-answer relevancy 0.92, context precision 1.00.
+So far Ragas has only had a 2-question smoke test, because the free Gemini quota runs out fast. It scored faithfulness 1.00, answer relevancy 0.92 and context precision 1.00. A full run is still to do.
+
+## CI thresholds
+
+`data/eval/thresholds.json` sets a minimum score for each metric, about 0.05 below the last measured score. That margin lets normal noise through but catches real regressions. When the system gets better, raise the thresholds. If you change the golden set, measure it again and reset them.
 
 ## Design decisions
 
-- **Every chunk gets a title/author header.** A chunk from the middle of a long description doesn't otherwise say which book it belongs to.
-- **The first eval set was saturated.** LLM-generated questions copied rare names from the descriptions, so BM25 scored MRR 1.000. The hand-written "vague" split fixed that and is where reranking shows its value.
-- **Citation validation fails closed.** An uncited answer is replaced by a refusal. End-to-end testing found a splitter bug: initials ("K. Sadlon") were being treated as sentence ends. There is now a regression test for it.
-- **Golden vs dev split.** Tune on dev, report and gate on golden. Tuning until the golden numbers go up turns golden into another dev set.
-- **The CI gate uses deterministic retrieval metrics first.** Ragas comes second, because LLM-graded metrics are noisy and cost quota.
+Every chunk starts with the book's title and author. Without that, a chunk from the middle of a long description gives no hint of which book it's from, and neither the retriever nor the LLM can tell.
+
+The first eval set was too easy. Its LLM-written questions reused rare words from the descriptions, so BM25 got a perfect MRR of 1.000 and every retriever looked about the same. The hand-written vague questions fixed that, and they're where reranking clearly earns its cost.
+
+Citation checking fails closed: if an answer has no citations, the user gets a refusal instead of an unsupported claim. End-to-end testing turned up a bug where author initials like "K. Sadlon" were read as the end of a sentence. That's fixed, and a regression test covers it.
+
+Tuning happens on dev, while reported numbers and the CI gate use golden. Tuning until the golden scores improve would quietly turn golden into a second dev set.
+
+CI runs the deterministic retrieval gate before Ragas. LLM-graded metrics are noisy and eat API quota, so they should only run once the cheap check has passed.

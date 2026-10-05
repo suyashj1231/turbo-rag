@@ -1,7 +1,7 @@
 {
   "_comment": "CI floors per eval set. Set ~0.05 below the measured score so real regressions fail but noise doesn't; raise them as the system improves (ratchet). CI gates on golden only.",
   "golden": {
-    "retrieval": {"hit": 0.95, "recall": 0.85, "mrr": 0.9},
+    "retrieval": {"hit": 0.93, "recall": 0.85, "mrr": 0.83},
     "ragas": {"faithfulness": 0.8, "answer_relevancy": 0.7, "context_precision": 0.6}
   },
   "dev": {
