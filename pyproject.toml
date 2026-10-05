@@ -9,16 +9,27 @@ dependencies = [
     "sentence-transformers>=3.0",  # local embedding model (Stage 1)
     "google-genai>=1.0",           # Gemini: answer generation + LLM-as-judge (free tier)
     "python-dotenv>=1.0",          # loads .env so GEMINI_API_KEY is in the environment
+    "fastapi>=0.142.2",            # HTTP API (stand-in for API Gateway + Lambda)
+    "uvicorn[standard]>=0.54.0",   # ASGI server for the API
+    "cohere>=7.2.0",               # Cohere Rerank (falls back to a local cross-encoder)
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-]
 # Stage 4+ comparisons only — do NOT import these in src/
 bench = [
     "faiss-cpu>=1.8",
     "rank-bm25>=0.2",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",   # FastAPI TestClient
+    "pytest>=8.0",
+]
+# Ragas eval (faithfulness / answer relevancy / context precision) — CI gate
+eval = [
+    "langchain-community<0.4",   # ragas 0.4.3 imports chat_models.vertexai, removed in 0.4
+    "ragas>=0.4.3",
 ]
 
 [project.scripts]
@@ -33,3 +44,6 @@ packages = ["src/turbo_rag"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+default-groups = ["dev", "eval"]

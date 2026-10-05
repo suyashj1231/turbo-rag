@@ -1,17 +1,13 @@
-"""Stage 1, step 4 — YOUR CODE: exact brute-force search. Ground truth.
+"""Stage 1, step 4: exact brute-force search. Ground truth.
 
-This is ~15 lines of numpy, but understand each line — every fancier index in
-this project is an approximation of THIS, and recall@k is always measured
-against its results.
+Every fancier index in this project is an approximation of THIS, and recall@k
+is always measured against its results.
 
-Hints:
-- Vectors are unit-normalized, so cosine similarity == inner product ==
-  one matrix-vector product: `scores = self.vectors @ query`  # (n,)
-- Top-k: `np.argsort` works; `np.argpartition` then sort the k winners is
-  O(n) instead of O(n log n) — nice, not required. Either way, return ids
-  sorted best-first.
-- memory_bytes: `self.vectors.nbytes`. For n chunks at d=384 float32 that's
-  n * 1536 bytes — the number TurboQuant will divide by ~32.
+- Vectors are unit-normalized, so cosine == inner product == one mat-vec.
+- Top-k via argpartition (O(n)) then sort only the k winners (O(k log k)),
+  instead of a full O(n log n) argsort.
+- At 7k books x 384 dims that's ~11 MB and ~1 ms per query. Brute force is
+  the right call until ~1M vectors; then you reach for HNSW/IVF/quantization.
 """
 
 import numpy as np
@@ -24,10 +20,15 @@ class FlatIndex:
         self.vectors: np.ndarray | None = None
 
     def add(self, vectors: np.ndarray) -> None:
-        raise NotImplementedError("TODO(suyash)")
+        vectors = np.asarray(vectors, dtype=np.float32)
+        self.vectors = vectors if self.vectors is None else np.vstack([self.vectors, vectors])
 
     def search(self, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-        raise NotImplementedError("TODO(suyash)")
+        scores = self.vectors @ query.astype(np.float32)  # (n,)
+        k = min(k, len(scores))
+        top = np.argpartition(-scores, k - 1)[:k]
+        top = top[np.argsort(-scores[top])]
+        return top, scores[top]
 
     def memory_bytes(self) -> int:
-        raise NotImplementedError("TODO(suyash)")
+        return 0 if self.vectors is None else self.vectors.nbytes

@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # 1. Unit tests: no models, no keys, seconds.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
+  # 2. Retrieval gate: deterministic, LLM-free. Validates the golden labels,
+  #    then fails the PR if hit@k / MRR / recall@k on the golden set drop
+  #    below thresholds.json.
+  retrieval-gate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Cache HF models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('src/turbo_rag/config.py') }}
+      - name: Cache corpus + index
+        id: corpus
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/raw/books.csv
+            data/processed
+          # rebuild the index only when ingestion code changes
+          key: corpus-${{ hashFiles('src/turbo_rag/ingest.py', 'src/turbo_rag/chunking.py', 'src/turbo_rag/embed.py', 'src/turbo_rag/config.py') }}
+      - name: Download Kaggle 7k books + ingest
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data/raw
+          curl -sL -o books.zip https://www.kaggle.com/api/v1/datasets/download/dylanjcastillo/7k-books-with-metadata
+          unzip -o books.zip -d data/raw
+          uv run rag ingest
+      - name: Validate golden labels against the corpus
+        run: uv run rag validate-golden
+      - name: Retrieval gate (golden set)
+        run: uv run rag eval --set golden --no-llm --gate
+        env:
+          RAG_RERANKER: local
+
+  # 3. Ragas gate: LLM-graded faithfulness / answer relevancy / context
+  #    precision. Needs the GEMINI_API_KEY repo secret; skipped without it.
+  ragas-gate:
+    needs: retrieval-gate
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.GEMINI_API_KEY != ''
+      - uses: astral-sh/setup-uv@v6
+        if: env.GEMINI_API_KEY != ''
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+        if: env.GEMINI_API_KEY != ''
+      - uses: actions/cache@v4
+        if: env.GEMINI_API_KEY != ''
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('src/turbo_rag/config.py') }}
+      - uses: actions/cache/restore@v4
+        if: env.GEMINI_API_KEY != ''
+        with:
+          path: |
+            data/raw/books.csv
+            data/processed
+          key: corpus-${{ hashFiles('src/turbo_rag/ingest.py', 'src/turbo_rag/chunking.py', 'src/turbo_rag/embed.py', 'src/turbo_rag/config.py') }}
+          fail-on-cache-miss: true
+      - name: LLM response cache (unchanged prompts cost nothing)
+        if: env.GEMINI_API_KEY != ''
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: llm-${{ github.sha }}
+          restore-keys: llm-
+      - run: uv run rag ragas --set golden --gate
+        if: env.GEMINI_API_KEY != ''
+      - uses: actions/upload-artifact@v4
+        if: always() && env.GEMINI_API_KEY != ''
+        with:
+          name: ragas-report
+          path: data/eval/ragas_report.json
